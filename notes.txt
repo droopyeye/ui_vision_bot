@@ -1,0 +1,21 @@
+# Create and activate the conda environment for UI Vision Lab
+cd C:/Users/lainehotte/source/repos/ui_vision_bot/config
+conda env create -f environment.yml
+
+# Activate the environment
+conda activate ui_vision_lab
+
+# Verify installations
+python -c "import PyQt5; print('PyQt OK')"
+python -c "import torch; print('Torch OK')"
+python -c "import easyocr; print('EasyOCR OK')"
+
+
+# Run the UI Vision Lab application
+# Correct fix: downgrade NumPy (recommended)
+# ERROR: A module that was compiled using NumPy 1.x cannot be run in
+#NumPy 2.4.0 as it may crash. To support both 1.x and 2.x
+#versions of NumPy, modules must be compiled with NumPy 2.0.
+conda install "numpy<2" -y
+
+python tools/ui_lab.py

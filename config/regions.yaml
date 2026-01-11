@@ -1,0 +1,20 @@
+image_space:
+  width: 3840 
+  height: 2100
+
+regions:
+  - id: region_0
+    x: 3400
+    y: 100
+    w: 50
+    h: 50
+    mode: ocr
+    label: undock_button
+
+  - id: region_1
+    x: 1200
+    y: 40
+    w: 300
+    h: 60
+    mode: template
+    label: gold_counter

@@ -1,0 +1,16 @@
+# ui_classes.yaml
+0: button
+1: icon
+2: text_block
+3: panel
+4: dialog
+5: tooltip
+6: checkbox
+7: slider
+8: dropdown
+9: minimap
+10: progress_bar
+11: notification
+12: cursor
+13: highlight
+14: disabled_button
