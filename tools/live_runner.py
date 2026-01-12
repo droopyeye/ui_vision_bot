@@ -145,7 +145,7 @@ class LiveRunner:
 
             # Example policy
             if state == "main_menu":
-                self.actions.execute(Action("click", "start_button"), self.regions)
+                self.actions.execute(Action("click", "button_undock"), self.regions)
 
             if keyboard.is_pressed(EMERGENCY_STOP_KEY):
                 print("Emergency stop pressed!")
