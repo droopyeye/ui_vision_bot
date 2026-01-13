@@ -40,6 +40,10 @@ class Region:
         self.template_image = data.get("template_image")
         self.ocr_text = data.get("ocr_text", "")
         self.click = data.get("click", {"mode": "center", "offset": [0, 0]})
+        self.template_confidence = 0.0
+        self.ocr_confidence = 0.0
+        self.hybrid_confidence = 0.0
+        self.matched = False  # True if template/OCR passes threshold
 
     def to_dict(self):
         return {
@@ -151,6 +155,21 @@ class UILabMainWindow(QMainWindow):
         right.addWidget(QLabel("Template Image"))
         right.addWidget(self.template_path_edit)
 
+        # REGION rect edits
+        right.addWidget(QLabel("Rect (x, y, w, h)"))
+        self.rect_x = QSpinBox(); self.rect_x.setMaximum(10000)
+        self.rect_y = QSpinBox(); self.rect_y.setMaximum(10000)
+        self.rect_w = QSpinBox(); self.rect_w.setMaximum(5000)
+        self.rect_h = QSpinBox(); self.rect_h.setMaximum(5000)
+        self.rect_x.valueChanged.connect(self._update_rect_from_ui)
+        self.rect_y.valueChanged.connect(self._update_rect_from_ui)
+        self.rect_w.valueChanged.connect(self._update_rect_from_ui)
+        self.rect_h.valueChanged.connect(self._update_rect_from_ui)
+        right.addWidget(self.rect_x)
+        right.addWidget(self.rect_y)
+        right.addWidget(self.rect_w)
+        right.addWidget(self.rect_h)
+
         btns = QHBoxLayout()
         add_btn = QPushButton("Add Region")
         add_btn.clicked.connect(self._add_region)
@@ -158,6 +177,10 @@ class UILabMainWindow(QMainWindow):
         draw_btn.clicked.connect(self._toggle_draw)
         save_btn = QPushButton("Save regions.yaml")
         save_btn.clicked.connect(self._save_regions)
+        btn_ocr = QPushButton("Analyze Frame")
+        btn_ocr.clicked.connect(self.update_region_analysis)
+        right.addWidget(btn_ocr)
+
 
         btns.addWidget(add_btn)
         btns.addWidget(draw_btn)
@@ -212,6 +235,13 @@ class UILabMainWindow(QMainWindow):
         self.ocr_text_edit.setText(r.ocr_text)
         self.template_path_edit.setText(str(r.template_image or ""))
 
+        # Set rect spin boxes
+        x, y, w, h = r.rect
+        self.rect_x.setValue(x)
+        self.rect_y.setValue(y)
+        self.rect_w.setValue(w)
+        self.rect_h.setValue(h)
+
     def _add_region(self):
         r = Region({"name": f"region_{len(self.regions)}"})
         self.regions.append(r)
@@ -234,6 +264,34 @@ class UILabMainWindow(QMainWindow):
         rect = QRectF(self.start_pos, pos).normalized()
         self.temp_rect_item.setRect(rect)
 
+    def _update_rect_from_ui(self):
+        item = self.region_list.currentItem()
+        if not item:
+            return
+        r = self.regions[self.region_list.row(item)]
+        r.rect = [
+            self.rect_x.value(),
+            self.rect_y.value(),
+            self.rect_w.value(),
+            self.rect_h.value()
+        ]
+        self._draw_regions()
+
+    def _draw_confidence_overlay(self, frame):
+        for r in self.regions:
+            x, y, w, h = r.rect
+            conf_text = ""
+            if r.type in ["ocr", "hybrid"]:
+                conf_text += f"OCR: {r.ocr_confidence:.2f} "
+            if r.type in ["template", "hybrid"]:
+                conf_text += f"Tmpl: {r.template_confidence:.2f} "
+            if r.type=="hybrid":
+                conf_text += f"Final: {r.hybrid_confidence:.2f}"
+
+            label = self.view.scene().addText(conf_text)
+            label.setDefaultTextColor(QColor("yellow"))
+            label.setPos(x, y-20)
+
     def finish_rect(self):
         rect = self.temp_rect_item.rect()
         self.view.scene().removeItem(self.temp_rect_item)
@@ -249,12 +307,71 @@ class UILabMainWindow(QMainWindow):
         self._draw_regions()
 
     def _draw_regions(self):
+        self.view.scene().clear()
+        pix = QPixmap.fromImage(cv_to_qimage(self.current_img))
+        self.view.scene().addPixmap(pix)
+
         for r in self.regions:
             x, y, w, h = r.rect
-            color = QColor("green") if r.type == "hybrid" else QColor("cyan")
-            item = QGraphicsRectItem(x, y, w, h)
-            item.setPen(QPen(color, 2))
-            self.view.scene().addItem(item)
+            color = QColor("green") if r.matched else QColor("cyan")
+            rect_item = QGraphicsRectItem(x, y, w, h)
+            rect_item.setPen(QPen(color, 2))
+            self.view.scene().addItem(rect_item)
+
+            # Click point
+            if self.preview_clicks and r.click:
+                mode = r.click.get("mode", "center")
+                offset = r.click.get("offset", [0,0])
+                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+                cx += offset[0]; cy += offset[1]
+                self.view.scene().addEllipse(cx-3, cy-3, 6, 6,
+                                            QPen(QColor("red")),
+                                            QColor(255,0,0,100))
+
+            # Confidence overlay
+            conf_text = f"OCR: {r.ocr_confidence:.2f} | Tmpl: {r.template_confidence:.2f}"
+            if r.type == "hybrid":
+                conf_text += f" | Final: {r.hybrid_confidence:.2f}"
+            label = self.view.scene().addText(conf_text)
+            label.setDefaultTextColor(QColor("yellow"))
+            label.setPos(x, y-20)
+
+    def update_region_analysis(self):
+        frame = self.current_img.copy()
+
+        for r in self.regions:
+            # ---- OCR confidence ----
+            if r.type in ["ocr", "hybrid"]:
+                result = self.reader.readtext(frame[r.rect[1]:r.rect[1]+r.rect[3],
+                                                r.rect[0]:r.rect[0]+r.rect[2]])
+                r.ocr_confidence = max([conf for _, text, conf in result], default=0.0)
+
+            # ---- Template confidence ----
+            if r.type in ["template", "hybrid"] and r.template_image:
+                tmpl = cv2.imread(str(r.template_image), cv2.IMREAD_UNCHANGED)
+                if tmpl is not None:
+                    roi = frame[r.rect[1]:r.rect[1]+r.rect[3],
+                                r.rect[0]:r.rect[0]+r.rect[2]]
+                    res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                    r.template_confidence = float(max_val)
+                else:
+                    r.template_confidence = 0.0
+
+            # ---- Hybrid aggregation ----
+            if r.type == "hybrid":
+                r.hybrid_confidence = (r.ocr_confidence + r.template_confidence) / 2.0
+
+            # Matched threshold (example: 0.7)
+            threshold = 0.7
+            if r.type == "hybrid":
+                r.matched = r.hybrid_confidence >= threshold
+            elif r.type == "ocr":
+                r.matched = r.ocr_confidence >= threshold
+            elif r.type == "template":
+                r.matched = r.template_confidence >= threshold
+
+        self._draw_regions()
 
     # ---------------- Entry ----------------
 
