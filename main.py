@@ -1,249 +1,168 @@
-from pathlib import Path
-from typing import Dict, List, Tuple
-
+# main.py
 import cv2
+from pathlib import Path
 import numpy as np
 import easyocr
 
-from utils.region_linter import lint_regions
-from utils.hybrid_eval import aggregate_confidence
+# -------------------------------
+# Region class definition
+# -------------------------------
+class Region:
+    def __init__(self, name, rect, type="template", template_image=None, ocr_text="", click=None, annotation=""):
+        self.name = name
+        self.rect = rect  # [x, y, w, h]
+        self.type = type  # template, ocr, hybrid
+        self.template_image = template_image
+        self.ocr_text = ocr_text
+        self.click = click  # {"mode": "center", "offset": [0,0]}
+        self.annotation = annotation
 
+        # runtime confidence
+        self.template_confidence = 0.0
+        self.ocr_confidence = 0.0
+        self.hybrid_confidence = 0.0
+        self.matched = False
 
-# -----------------------------
-# OCR Reader (lazy init)
-# -----------------------------
+# -------------------------------
+# OCR Reader
+# -------------------------------
+reader = easyocr.Reader(["en"], gpu=True)
 
-_OCR_READER = None
+# -------------------------------
+# Template matching helper
+# -------------------------------
+def match_template_region(frame, region, run_dir):
+    """Return template confidence for a single region."""
+    if not region.template_image:
+        return 0.0
 
+    tmpl_path = (Path(run_dir) / region.template_image).resolve()
+    tmpl = cv2.imread(str(tmpl_path), cv2.IMREAD_UNCHANGED)
+    if tmpl is None:
+        print(f"⚠️ Template not found for region {region.name}: {tmpl_path}")
+        return 0.0
 
-def get_ocr_reader(gpu=True):
-    global _OCR_READER
-    if _OCR_READER is None:
-        _OCR_READER = easyocr.Reader(["en"], gpu=gpu)
-    return _OCR_READER
+    x, y, w, h = region.rect
+    roi = frame[y:y+h, x:x+w]
 
+    # ROI must be large enough for template
+    if roi.shape[0] < tmpl.shape[0] or roi.shape[1] < tmpl.shape[1]:
+        print(f"⚠️ ROI smaller than template for {region.name}")
+        return 0.0
 
-# -----------------------------
-# Region loading
-# -----------------------------
+    # Grayscale for robustness
+    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
 
-def load_regions_yaml(path: Path) -> List[dict]:
-    import yaml
+    res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, _ = cv2.minMaxLoc(res)
 
-    if not path.exists():
-        raise FileNotFoundError(path)
+    return float(max_val)
 
-    with open(path, "r", encoding="utf-8") as f:
-        regions = yaml.safe_load(f)
+# -------------------------------
+# Analyze a single region
+# -------------------------------
+def analyze_region(frame, region, run_dir, ocr_reader=reader):
+    """
+    Compute template, OCR, and hybrid confidence for a region.
+    Updates region.matched according to thresholds.
+    """
+    # Template confidence
+    template_conf = match_template_region(frame, region, run_dir)
 
-    if not isinstance(regions, list):
-        raise ValueError("regions.yaml must contain a list")
+    # OCR confidence
+    ocr_conf = 0.0
+    if region.type in ["ocr", "hybrid"]:
+        x, y, w, h = region.rect
+        roi = frame[y:y+h, x:x+w]
+        result = ocr_reader.readtext(roi)
+        ocr_conf = max([conf for _, text, conf in result], default=0.0)
 
+    # Hybrid
+    hybrid_conf = 0.0
+    if region.type == "hybrid":
+        hybrid_conf = (template_conf + ocr_conf) / 2.0
+
+    # Update region object
+    region.template_confidence = template_conf
+    region.ocr_confidence = ocr_conf
+    region.hybrid_confidence = hybrid_conf
+
+    # Determine matched status
+    threshold = 0.7
+    if region.type == "hybrid":
+        region.matched = hybrid_conf >= threshold
+    elif region.type == "ocr":
+        region.matched = ocr_conf >= threshold
+    elif region.type == "template":
+        region.matched = template_conf >= threshold
+
+    return region.matched
+
+# -------------------------------
+# Run analysis on all regions
+# -------------------------------
+def analyze_frame(frame, regions, run_dir):
+    for r in regions:
+        analyze_region(frame, r, run_dir)
     return regions
 
-# -----------------------------
-# Policy loading
-# -----------------------------
-def load_policy_yaml(path: Path) -> list[dict]:
-    import yaml
-
-    if not path.exists():
-        return []
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-
-    return data.get("policies", [])
-
-
-# -----------------------------
-# Template matching
-# -----------------------------
-
-def match_templates(
-    frame: np.ndarray,
-    regions: List[dict],
-) -> Dict[str, Tuple[bool, float]]:
+# -------------------------------
+# Debug overlay for visualization
+# -------------------------------
+def draw_debug_overlay(frame, regions):
     """
-    Returns:
-        { region_name: (matched, confidence) }
+    Draw rectangles, click points, and confidence labels.
+    Returns a new frame with overlays.
     """
-    results = {}
-
+    frame_overlay = frame.copy()
     for r in regions:
-        name = r["name"]
-        if r["type"] not in {"template", "hybrid"}:
-            continue
+        x, y, w, h = r.rect
+        color = (0,255,0) if r.matched else (0,0,255)
+        cv2.rectangle(frame_overlay, (x,y), (x+w, y+h), color, 2)
 
-        tmpl_cfg = r.get("template")
-        if not tmpl_cfg:
-            results[name] = (False, 0.0)
-            continue
+        # Click point
+        if r.click:
+            mode = r.click.get("mode", "center")
+            offset = r.click.get("offset", [0,0])
+            cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+            cx += offset[0]; cy += offset[1]
+            cv2.circle(frame_overlay, (cx, cy), 5, (255,0,0), -1)
 
-        rect = r["rect"]
-        x, y, w, h = rect
-        roi = frame[y : y + h, x : x + w]
+        # Confidence label
+        label = f"{r.name} | Tmpl:{r.template_confidence:.2f} OCR:{r.ocr_confidence:.2f}"
+        if r.type=="hybrid":
+            label += f" Hybrid:{r.hybrid_confidence:.2f}"
+        cv2.putText(frame_overlay, label, (x, y-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 1)
+    return frame_overlay
 
-        tmpl_path = Path(tmpl_cfg["image"])
-        if not tmpl_path.exists():
-            results[name] = (False, 0.0)
-            continue
+# -------------------------------
+# Example usage
+# -------------------------------
+if __name__ == "__main__":
+    run_dir = Path(".")  # change as needed
+    frame_path = run_dir / "debug_runs/frame_example.png"
+    frame = cv2.imread(str(frame_path))
+    if frame is None:
+        raise FileNotFoundError(f"Frame not found: {frame_path}")
 
-        tmpl = cv2.imread(str(tmpl_path))
-        if tmpl is None:
-            results[name] = (False, 0.0)
-            continue
+    # Example regions
+    regions = [
+        Region(
+            name="button_undock",
+            rect=[330, 100, 100, 50],
+            type="hybrid",
+            template_image="templates/button-undock.png",
+            click={"mode":"center","offset":[0,0]}
+        )
+    ]
 
-        method = tmpl_cfg.get("method", cv2.TM_CCOEFF_NORMED)
-        res = cv2.matchTemplate(roi, tmpl, method)
-        _, max_val, _, _ = cv2.minMaxLoc(res)
+    # Analyze frame
+    analyze_frame(frame, regions, run_dir)
 
-        threshold = tmpl_cfg.get("threshold", 0.8)
-        results[name] = (max_val >= threshold, float(max_val))
-
-    return results
-
-
-# -----------------------------
-# OCR
-# -----------------------------
-
-def run_ocr(
-    frame: np.ndarray,
-    regions: List[dict],
-    gpu=True,
-) -> Dict[str, Tuple[bool, float]]:
-    """
-    Returns:
-        { region_name: (matched, confidence) }
-    """
-    reader = get_ocr_reader(gpu=gpu)
-    results = {}
-
-    for r in regions:
-        name = r["name"]
-        if r["type"] not in {"ocr", "hybrid"}:
-            continue
-
-        ocr_cfg = r.get("ocr")
-        if not ocr_cfg:
-            results[name] = (False, 0.0)
-            continue
-
-        rect = r["rect"]
-        x, y, w, h = rect
-        roi = frame[y : y + h, x : x + w]
-
-        detections = reader.readtext(roi)
-
-        target = ocr_cfg.get("text", "")
-        match_mode = ocr_cfg.get("match", "contains")
-        min_conf = ocr_cfg.get("confidence", 0.5)
-
-        best_conf = 0.0
-        matched = False
-
-        for _, text, conf in detections:
-            norm_text = text.strip()
-            if not norm_text:
-                continue
-
-            text_match = False
-            if match_mode == "exact":
-                text_match = norm_text == target
-            elif match_mode == "contains":
-                text_match = target.lower() in norm_text.lower()
-            elif match_mode == "regex":
-                import re
-                text_match = bool(re.search(target, norm_text))
-
-            if text_match:
-                best_conf = max(best_conf, conf)
-                matched = conf >= min_conf
-
-        results[name] = (matched, float(best_conf))
-
-    return results
-
-
-# -----------------------------
-# Hybrid evaluation (shared)
-# -----------------------------
-
-def evaluate_hybrid_region(region, template_result, ocr_result):
-    logic = region.get("logic", {})
-    require = logic.get("require", ["template", "ocr"])
-    aggregate = logic.get("aggregate", "min")
-
-    checks = {
-        "template": template_result,
-        "ocr": ocr_result,
-    }
-
-    for key in require:
-        matched, _ = checks[key]
-        if not matched:
-            return False, 0.0, key
-
-    confidences = [checks[k][1] for k in require]
-    return True, aggregate_confidence(confidences, aggregate), None
-
-
-# -----------------------------
-# Frame analysis entry point
-# -----------------------------
-
-def analyze_frame(
-    frame: np.ndarray,
-    regions: List[dict],
-    gpu=True,
-):
-    """
-    Unified analysis used by UI Lab, replay viewer, or live runner.
-
-    Returns:
-        {
-          region_name: {
-            matched: bool,
-            confidence: float,
-            type: str
-          }
-        }
-    """
-    template_results = match_templates(frame, regions)
-    ocr_results = run_ocr(frame, regions, gpu=gpu)
-
-    results = {}
-
-    for r in regions:
-        name = r["name"]
-        rtype = r["type"]
-
-        if rtype == "template":
-            m, c = template_results.get(name, (False, 0.0))
-            results[name] = {
-                "matched": m,
-                "confidence": c,
-                "type": rtype,
-            }
-
-        elif rtype == "ocr":
-            m, c = ocr_results.get(name, (False, 0.0))
-            results[name] = {
-                "matched": m,
-                "confidence": c,
-                "type": rtype,
-            }
-
-        elif rtype == "hybrid":
-            tmpl = template_results.get(name, (False, 0.0))
-            ocr = ocr_results.get(name, (False, 0.0))
-            ok, conf, failed = evaluate_hybrid_region(r, tmpl, ocr)
-            results[name] = {
-                "matched": ok,
-                "confidence": conf,
-                "type": rtype,
-                "failed": failed,
-            }
-
-    return results
+    # Overlay debug
+    frame_overlay = draw_debug_overlay(frame, regions)
+    cv2.imshow("Debug Overlay", frame_overlay)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()

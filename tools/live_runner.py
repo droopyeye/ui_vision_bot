@@ -1,157 +1,97 @@
+# live_runner.py
 import time
 from pathlib import Path
-
 import cv2
 import numpy as np
+import mss
 import pyautogui
+import yaml
 
-from utils.policy_engine import PolicyEngine
-from main import (
-    load_regions_yaml,
-    load_policy_yaml,
-    analyze_frame,
-)
+from main import Region, analyze_region, draw_debug_overlay, reader
 
 # -------------------------------
-# CONFIG
+# Config
 # -------------------------------
-
-EMERGENCY_STOP_KEY = "esc"
-FRAME_DELAY = 0.1  # seconds between frames
-DEFAULT_CONFIDENCE = 0.0
-
+RUN_DIR = Path("debug_runs/run_latest")  # set to your run folder
+DEBUG_OVERLAY = True
+EMERGENCY_STOP_KEY = "esc"  # press to stop the runner
+CLICK_ENABLED = False       # set True to execute clicks
+MATCH_INTERVAL = 0.5        # seconds between frame analyses
 
 # -------------------------------
-# LIVE RUNNER
+# Load regions from YAML
 # -------------------------------
-
-class LiveRunner:
-    def __init__(self, run_dir: Path):
-        self.run_dir = Path(run_dir)
-        self.running = False
-
-        # Load config
-        self.regions = load_regions_yaml(self.run_dir / "regions.yaml")
-        self.policies = load_policy_yaml(self.run_dir / "policy.yaml")
-
-        self.policy_engine = PolicyEngine(self.policies)
-
-        # Safety
-        pyautogui.FAILSAFE = True
-        pyautogui.PAUSE = 0.05
-
-        print(f"✅ Loaded {len(self.regions)} regions")
-        print(f"✅ Loaded {len(self.policies)} policies")
-
-    # ---------------------------
-    # FRAME CAPTURE
-    # ---------------------------
-
-    def capture_frame(self) -> np.ndarray:
-        """
-        Capture full screen frame using OpenCV (via pyautogui).
-        """
-        img = pyautogui.screenshot()
-        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        return frame
-
-    # ---------------------------
-    # CLICK LOGIC
-    # ---------------------------
-
-    def _click(self, region: dict, confidence: float):
-        rect = region["rect"]
-        x, y, w, h = rect
-
-        mode = region.get("click", {}).get("mode", "center")
-        offset = region.get("click", {}).get("offset", [0, 0])
-
-        if mode == "center":
-            cx = x + w // 2
-            cy = y + h // 2
-        else:
-            cx = x
-            cy = y
-
-        cx += offset[0]
-        cy += offset[1]
-
-        print(
-            f"🖱 Click {region['name']} @ ({cx}, {cy}) "
-            f"conf={confidence:.2f}"
-        )
-
-        pyautogui.moveTo(cx, cy, duration=0.05)
-        pyautogui.click()
-
-    # ---------------------------
-    # MAIN LOOP
-    # ---------------------------
-
-    def run(self):
-        print("▶ Live runner started (ESC to stop)")
-        self.running = True
-
-        while self.running:
-            # ---- Emergency stop ----
-            if pyautogui.keyDown(EMERGENCY_STOP_KEY):
-                print("🛑 Emergency stop key pressed")
-                break
-
-            # ---- Capture ----
-            frame = self.capture_frame()
-
-            # ---- Analyze ----
-            analysis = analyze_frame(
-                frame,
-                self.regions,
-                gpu=True,  # OCR GPU only (as requested)
-            )
-
-            # ---- Policy evaluation ----
-            decision = self.policy_engine.evaluate(analysis)
-
-            if decision:
-                action = decision["action"]
-                region_name = decision["region"]
-
-                region = next(
-                    r for r in self.regions if r["name"] == region_name
+def load_regions_yaml(run_dir: Path):
+    yaml_file = run_dir / "regions.yaml"
+    regions = []
+    if yaml_file.exists():
+        with open(yaml_file, "r") as f:
+            data = yaml.safe_load(f)
+        for r in data:
+            regions.append(
+                Region(
+                    name=r.get("name"),
+                    rect=r.get("rect"),
+                    type=r.get("type","template"),
+                    template_image=r.get("template_image"),
+                    click=r.get("click"),
+                    annotation=r.get("annotation","")
                 )
+            )
+    else:
+        print(f"⚠️ No regions.yaml found in {run_dir}")
+    return regions
 
-                if action["type"] == "click":
-                    self._click(region, decision.get("confidence", 0.0))
-
-                elif action["type"] == "stop":
-                    print("🛑 Policy stop triggered")
-                    break
-
-            time.sleep(FRAME_DELAY)
-
-        self.running = False
-        print("■ Live runner stopped")
-
+regions = load_regions_yaml(RUN_DIR)
+if not regions:
+    print("No regions loaded. Exiting.")
+    exit(1)
 
 # -------------------------------
-# CLI ENTRY
+# Screen capture setup
 # -------------------------------
+sct = mss.mss()
+monitor = sct.monitors[2]  # change monitor index if needed
 
-def main():
-    import argparse
+# -------------------------------
+# Live runner loop
+# -------------------------------
+try:
+    while True:
+        # Emergency stop
+        if pyautogui.keyDown(EMERGENCY_STOP_KEY):
+            print("Emergency stop pressed!")
+            break
 
-    parser = argparse.ArgumentParser(description="UI Vision Live Runner")
-    parser.add_argument(
-        "--run-dir",
-        type=str,
-        required=True,
-        help="Path to debug run directory",
-    )
+        # Capture screen
+        frame = np.array(sct.grab(monitor))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-    args = parser.parse_args()
+        # Analyze each region
+        for r in regions:
+            analyze_region(frame, r, RUN_DIR, ocr_reader=reader)
 
-    runner = LiveRunner(Path(args.run_dir))
-    runner.run()
+            # Optional click execution
+            if CLICK_ENABLED and r.matched and r.click:
+                x, y, w, h = r.rect
+                mode = r.click.get("mode", "center")
+                offset = r.click.get("offset", [0,0])
+                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+                cx += offset[0]; cy += offset[1]
+                pyautogui.click(cx, cy)
+                print(f"Clicked {r.name} at {cx},{cy}")
 
+        # Draw debug overlay
+        if DEBUG_OVERLAY:
+            overlay_frame = draw_debug_overlay(frame, regions)
+            cv2.imshow("Live Debug Overlay", overlay_frame)
 
-if __name__ == "__main__":
-    main()
+        # Exit on 'q' key
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+        # Sleep to reduce CPU load
+        time.sleep(MATCH_INTERVAL)
+
+finally:
+    cv2.destroyAllWindows()

@@ -180,7 +180,9 @@ class UILabMainWindow(QMainWindow):
         btn_ocr = QPushButton("Analyze Frame")
         btn_ocr.clicked.connect(self.update_region_analysis)
         right.addWidget(btn_ocr)
-
+        btn_template_overlay = QPushButton("Run Template Overlay")
+        btn_template_overlay.clicked.connect(self.run_template_overlay)
+        right.addWidget(btn_template_overlay)
 
         btns.addWidget(add_btn)
         btns.addWidget(draw_btn)
@@ -292,6 +294,69 @@ class UILabMainWindow(QMainWindow):
             label.setDefaultTextColor(QColor("yellow"))
             label.setPos(x, y-20)
 
+    def run_template_overlay(self):
+        """
+        For each region with a template, perform template matching and
+        draw the match result as a rectangle over the frame.
+        """
+        if not hasattr(self, "current_img"):
+            return
+
+        frame = self.current_img.copy()
+        self.view.scene().clear()
+        pix = QPixmap.fromImage(cv_to_qimage(frame))
+        self.view.scene().addPixmap(pix)
+
+        for r in self.regions:
+            if not r.template_image:
+                continue
+
+            # Load template
+            tmpl_path = (self.run_dir / r.template_image).resolve()
+            tmpl = cv2.imread(str(tmpl_path), cv2.IMREAD_UNCHANGED)
+            if tmpl is None:
+                print(f"⚠️ Template not found for region {r.name}")
+                continue
+
+            # ROI from region rect
+            x, y, w, h = r.rect
+            roi = frame[y:y+h, x:x+w]
+
+            # Convert to grayscale for robustness
+            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+
+            # Run template match
+            res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            r.template_confidence = float(max_val)
+
+            # Draw template match rectangle
+            top_left = (x + max_loc[0], y + max_loc[1])
+            bottom_right = (top_left[0] + tmpl.shape[1], top_left[1] + tmpl.shape[0])
+            rect_item = self.view.scene().addRect(
+                top_left[0], top_left[1],
+                tmpl.shape[1], tmpl.shape[0],
+                QPen(QColor("red"), 2)
+            )
+
+            # Draw click point if enabled
+            if self.preview_clicks and r.click:
+                mode = r.click.get("mode", "center")
+                offset = r.click.get("offset", [0, 0])
+                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+                cx += offset[0]
+                cy += offset[1]
+                self.view.scene().addEllipse(cx-3, cy-3, 6, 6,
+                                            QPen(QColor("blue")),
+                                            QColor(0,0,255,100))
+
+            # Add confidence label
+            label_text = f"{r.name} conf: {r.template_confidence:.2f}"
+            label_item = self.view.scene().addText(label_text)
+            label_item.setDefaultTextColor(QColor("yellow"))
+            label_item.setPos(x, y-20)
+
     def finish_rect(self):
         rect = self.temp_rect_item.rect()
         self.view.scene().removeItem(self.temp_rect_item)
@@ -348,15 +413,25 @@ class UILabMainWindow(QMainWindow):
 
             # ---- Template confidence ----
             if r.type in ["template", "hybrid"] and r.template_image:
-                tmpl = cv2.imread(str(r.template_image), cv2.IMREAD_UNCHANGED)
-                if tmpl is not None:
-                    roi = frame[r.rect[1]:r.rect[1]+r.rect[3],
-                                r.rect[0]:r.rect[0]+r.rect[2]]
-                    res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
-                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                    r.template_confidence = float(max_val)
-                else:
+                tmpl_path = (self.run_dir / r.template_image).resolve()
+                tmpl = cv2.imread(str(tmpl_path), cv2.IMREAD_UNCHANGED)
+                if tmpl is None:
                     r.template_confidence = 0.0
+                else:
+                    # Make sure ROI is large enough
+                    x, y, w, h = r.rect
+                    roi = self.current_img[y:y+h, x:x+w]
+                    if roi.shape[0] < tmpl.shape[0] or roi.shape[1] < tmpl.shape[1]:
+                        print(f"ROI smaller than template for {r.name}")
+                        r.template_confidence = 0.0
+                    else:
+                        # Convert both to grayscale for consistent matching
+                        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                        tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
+                        res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
+                        _, max_val, _, _ = cv2.minMaxLoc(res)
+                        r.template_confidence = float(max_val)
+                        print(f"{r.name} ROI size: {roi.shape}, Template size: {tmpl.shape}, Confidence: {r.template_confidence}")
 
             # ---- Hybrid aggregation ----
             if r.type == "hybrid":
