@@ -1,0 +1,22 @@
+policies:
+  - name: click_undock
+    description: "Click Undock button when visible"
+
+    when:
+      region: button_undock
+      matched: true
+      confidence_gte: 0.75
+
+    action:
+      type: click
+      cooldown: 2.0   # seconds
+
+  - name: emergency_stop
+    description: "Stop automation if Disconnect appears"
+
+    when:
+      region: disconnect_warning
+      matched: true
+
+    action:
+      type: stop

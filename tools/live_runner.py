@@ -1,174 +1,157 @@
 import time
-import threading
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Dict, Optional
 
 import cv2
 import numpy as np
-import mss
-import yaml
-import easyocr
 import pyautogui
-import keyboard
 
-from utils.region_linter import lint_regions, Region
-from main import run_ocr, match_templates, load_regions_yaml
+from utils.policy_engine import PolicyEngine
+from main import (
+    load_regions_yaml,
+    load_policy_yaml,
+    analyze_frame,
+)
 
+# -------------------------------
+# CONFIG
+# -------------------------------
 
-# =========================
-# Configuration
-# =========================
-CAPTURE_INTERVAL = 0.5   # seconds
-CLICK_COOLDOWN = 1.0     # seconds
 EMERGENCY_STOP_KEY = "esc"
+FRAME_DELAY = 0.1  # seconds between frames
+DEFAULT_CONFIDENCE = 0.0
 
 
-# =========================
-# Action model
-# =========================
-@dataclass
-class Action:
-    type: str           # "click"
-    target: str         # region name
+# -------------------------------
+# LIVE RUNNER
+# -------------------------------
 
-
-# =========================
-# Live Vision Engine
-# =========================
-class LiveVisionEngine:
-    def __init__(self, regions, reader, run_dir):
-        self.regions = regions
-        self.reader = reader
-        self.run_dir = run_dir
-
-    def process(self, frame):
-        ocr = run_ocr(frame, self.regions, self.reader)
-        templates = match_templates(frame, self.regions, self.run_dir)
-        return {
-            "ocr": ocr,
-            "templates": templates
-        }
-
-
-# =========================
-# State Resolver (minimal)
-# =========================
-class StateResolver:
-    def __init__(self, regions):
-        self.regions = regions
-
-    def resolve(self, vision) -> str:
-        # Example: main menu if start button visible
-        for r in self.regions:
-            if r.type in ["template", "hybrid"]:
-                match = vision["templates"].get(r.name)
-                if match and match[0] > 0.85:
-                    return "main_menu"
-        return "unknown"
-
-
-# =========================
-# Action Engine
-# =========================
-class ActionEngine:
-    def __init__(self):
-        self.last_action = 0.0
-
-    def can_act(self):
-        return time.time() - self.last_action > CLICK_COOLDOWN
-
-    def execute(self, action: Action, regions):
-        if not self.can_act():
-            return
-
-        region = next((r for r in regions if r.name == action.target), None)
-        if not region:
-            return
-
-        x = region.x + region.w // 2
-        y = region.y + region.h // 2
-
-        if action.type == "click":
-            pyautogui.moveTo(x, y, duration=0.1)
-            pyautogui.click()
-            self.last_action = time.time()
-            print(f"[ACTION] Clicked {region.name} at ({x},{y})")
-
-
-# =========================
-# Live Runner
-# =========================
 class LiveRunner:
     def __init__(self, run_dir: Path):
-        self.run_dir = run_dir
-        self.regions = load_regions_yaml(run_dir / "regions.yaml")
-        self.reader = easyocr.Reader(["en"], gpu=False)
-        self.vision = LiveVisionEngine(self.regions, self.reader, run_dir)
-        self.actions = ActionEngine()
-        self.state_resolver = StateResolver(self.regions)
+        self.run_dir = Path(run_dir)
+        self.running = False
 
-        self.running = True
+        # Load config
+        self.regions = load_regions_yaml(self.run_dir / "regions.yaml")
+        self.policies = load_policy_yaml(self.run_dir / "policy.yaml")
 
-        self._lint()
+        self.policy_engine = PolicyEngine(self.policies)
 
-    def _lint(self):
-        with mss.mss() as sct:
-            monitor = sct.monitors[2]
-            img = np.array(sct.grab(monitor))
-            h, w = img.shape[:2]
-        issues = lint_regions(self.regions, w, h, self.run_dir)
-        if issues:
-            print("⚠ Region lint issues:")
-            for k, msgs in issues.items():
-                for m in msgs:
-                    print(f"  {k}: {m}")
+        # Safety
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.05
 
-    def capture_frame(self):
-        with mss.mss() as sct:
-            monitor = sct.monitors[2]
-            img = np.array(sct.grab(monitor))
-            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        print(f"✅ Loaded {len(self.regions)} regions")
+        print(f"✅ Loaded {len(self.policies)} policies")
+
+    # ---------------------------
+    # FRAME CAPTURE
+    # ---------------------------
+
+    def capture_frame(self) -> np.ndarray:
+        """
+        Capture full screen frame using OpenCV (via pyautogui).
+        """
+        img = pyautogui.screenshot()
+        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        return frame
+
+    # ---------------------------
+    # CLICK LOGIC
+    # ---------------------------
+
+    def _click(self, region: dict, confidence: float):
+        rect = region["rect"]
+        x, y, w, h = rect
+
+        mode = region.get("click", {}).get("mode", "center")
+        offset = region.get("click", {}).get("offset", [0, 0])
+
+        if mode == "center":
+            cx = x + w // 2
+            cy = y + h // 2
+        else:
+            cx = x
+            cy = y
+
+        cx += offset[0]
+        cy += offset[1]
+
+        print(
+            f"🖱 Click {region['name']} @ ({cx}, {cy}) "
+            f"conf={confidence:.2f}"
+        )
+
+        pyautogui.moveTo(cx, cy, duration=0.05)
+        pyautogui.click()
+
+    # ---------------------------
+    # MAIN LOOP
+    # ---------------------------
 
     def run(self):
         print("▶ Live runner started (ESC to stop)")
-        last_state = None
+        self.running = True
 
         while self.running:
-            frame = self.capture_frame()
-            vision = self.vision.process(frame)
-            state = self.state_resolver.resolve(vision)
-
-            if state != last_state:
-                print(f"[STATE] {state}")
-                last_state = state
-
-            # Example policy
-            if state == "main_menu":
-                self.actions.execute(Action("click", "button_undock"), self.regions)
-
-            if keyboard.is_pressed(EMERGENCY_STOP_KEY):
-                print("Emergency stop pressed!")
-                self.running = False
+            # ---- Emergency stop ----
+            if pyautogui.keyDown(EMERGENCY_STOP_KEY):
+                print("🛑 Emergency stop key pressed")
                 break
 
-            time.sleep(CAPTURE_INTERVAL)
+            # ---- Capture ----
+            frame = self.capture_frame()
+
+            # ---- Analyze ----
+            analysis = analyze_frame(
+                frame,
+                self.regions,
+                gpu=True,  # OCR GPU only (as requested)
+            )
+
+            # ---- Policy evaluation ----
+            decision = self.policy_engine.evaluate(analysis)
+
+            if decision:
+                action = decision["action"]
+                region_name = decision["region"]
+
+                region = next(
+                    r for r in self.regions if r["name"] == region_name
+                )
+
+                if action["type"] == "click":
+                    self._click(region, decision.get("confidence", 0.0))
+
+                elif action["type"] == "stop":
+                    print("🛑 Policy stop triggered")
+                    break
+
+            time.sleep(FRAME_DELAY)
+
+        self.running = False
+        print("■ Live runner stopped")
 
 
-# =========================
-# Entry point
-# =========================
-if __name__ == "__main__":
-    import sys
+# -------------------------------
+# CLI ENTRY
+# -------------------------------
 
-    if len(sys.argv) < 2:
-        print("Usage: python live_runner.py <run_dir>")
-        sys.exit(1)
+def main():
+    import argparse
 
-    run_dir = Path(sys.argv[1])
-    if not run_dir.exists():
-        print("Run directory not found")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="UI Vision Live Runner")
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        required=True,
+        help="Path to debug run directory",
+    )
 
-    runner = LiveRunner(run_dir)
+    args = parser.parse_args()
+
+    runner = LiveRunner(Path(args.run_dir))
     runner.run()
+
+
+if __name__ == "__main__":
+    main()

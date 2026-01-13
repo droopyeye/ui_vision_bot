@@ -1,160 +1,211 @@
-"""
-Region linter for UI Vision Bot
-
-Checks regions for:
-- zero or negative size
-- out-of-bounds
-- overlaps
-- missing template images
-- suspicious annotations
-
-Designed to work with:
-- ui_lab.py (visual overlays)
-- main.py (offline processing)
-- live_runner.py (live automation)
-"""
-
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict
-from PyQt6.QtCore import QRect
+from typing import Dict, List, Tuple, Any
 
 
-# =========================
-# Region model
-# =========================
+# -----------------------------
+# Lint result structure
+# -----------------------------
+
 @dataclass
-class Region:
-    name: str
-    type: str                 # button | template | ocr | hybrid
-    x: int
-    y: int
-    w: int
-    h: int
-    annotation: str = ""
-    template_image: str = ""
+class LintMessage:
+    level: str        # "error" | "warning"
+    region: str       # region name
+    message: str
+
+    def __str__(self):
+        return f"[{self.level.upper()}] {self.region}: {self.message}"
 
 
-# =========================
-# Lint regions
-# =========================
+# -----------------------------
+# Public API
+# -----------------------------
+
 def lint_regions(
-    regions: List[Region],
+    regions: List[Dict[str, Any]],
     img_w: int,
     img_h: int,
-    run_dir: Path | None = None
-) -> Dict[str, List[str]]:
+    base_dir: Path | None = None,
+) -> List[LintMessage]:
     """
-    Lint a list of regions.
-
-    Returns:
-        { region_name: [issues...] }
+    Lint region definitions against schema and image bounds.
     """
+    messages: List[LintMessage] = []
+    seen_names = set()
 
-    issues: Dict[str, List[str]] = {}
-
-    def add(r: Region, msg: str):
-        issues.setdefault(r.name, []).append(msg)
-
-    # -------------------------
-    # Size & bounds checks
-    # -------------------------
     for r in regions:
-        if r.w <= 0 or r.h <= 0:
-            add(r, "zero or negative size")
+        name = r.get("name", "<unnamed>")
+        rtype = r.get("type")
 
-        if r.x < 0 or r.y < 0:
-            add(r, "negative coordinates")
+        # ---- name ----
+        if not r.get("name"):
+            messages.append(err(name, "Region missing 'name'"))
+        elif name in seen_names:
+            messages.append(err(name, "Duplicate region name"))
+        seen_names.add(name)
 
-        if r.x + r.w > img_w or r.y + r.h > img_h:
-            add(r, "out of bounds")
+        # ---- type ----
+        if rtype not in {"button", "template", "ocr", "hybrid"}:
+            messages.append(err(name, f"Unknown region type '{rtype}'"))
+            continue
 
-        # Annotation sanity
-        if r.annotation and len(r.annotation) > 64:
-            add(r, f"annotation too long ({len(r.annotation)} chars)")
+        # ---- rect ----
+        rect = r.get("rect")
+        if not valid_rect(rect):
+            messages.append(err(name, "Invalid rect; expected [x, y, w, h]"))
+        else:
+            messages.extend(lint_rect_bounds(name, rect, img_w, img_h))
 
-        # Template existence
-        if r.type in ("template", "hybrid"):
-            if not r.template_image:
-                add(r, "template region missing template_image")
-            elif run_dir:
-                template_path = run_dir / r.template_image
-                if not template_path.exists():
-                    add(r, f"template image missing: {r.template_image}")
+        # ---- per-type checks ----
+        if rtype == "template":
+            messages.extend(lint_template(name, r, base_dir))
 
-    # -------------------------
-    # Overlap detection
-    # -------------------------
-    for i, a in enumerate(regions):
-        rect_a = QRect(a.x, a.y, a.w, a.h)
-        for b in regions[i + 1:]:
-            rect_b = QRect(b.x, b.y, b.w, b.h)
-            if rect_a.intersects(rect_b):
-                add(a, f"overlaps {b.name}")
-                add(b, f"overlaps {a.name}")
+        elif rtype == "ocr":
+            messages.extend(lint_ocr(name, r))
 
-    return issues
+        elif rtype == "hybrid":
+            messages.extend(lint_hybrid(name, r, base_dir))
 
-
-# =========================
-# YAML helper (optional)
-# =========================
-def regions_from_yaml(path: Path) -> List[Region]:
-    """
-    Load regions.yaml into Region objects.
-    """
-    import yaml
-
-    if not path.exists():
-        return []
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or []
-
-    regions: List[Region] = []
-    for d in data:
-        regions.append(Region(
-            name=d.get("name", ""),
-            type=d.get("type", "button"),
-            x=int(d.get("x", 0)),
-            y=int(d.get("y", 0)),
-            w=int(d.get("w", 0)),
-            h=int(d.get("h", 0)),
-            annotation=d.get("annotation", ""),
-            template_image=d.get("template_image", "")
-        ))
-    return regions
+    return messages
 
 
-# =========================
-# CLI test utility
-# =========================
-if __name__ == "__main__":
-    import cv2
-    import sys
+# -----------------------------
+# Rect validation
+# -----------------------------
 
-    if len(sys.argv) < 3:
-        print("Usage: python region_linter.py <frame.png> <regions.yaml>")
-        sys.exit(1)
+def valid_rect(rect) -> bool:
+    return (
+        isinstance(rect, list)
+        and len(rect) == 4
+        and all(isinstance(v, (int, float)) for v in rect)
+        and rect[2] > 0
+        and rect[3] > 0
+    )
 
-    frame_path = Path(sys.argv[1])
-    regions_path = Path(sys.argv[2])
-    run_dir = regions_path.parent
 
-    img = cv2.imread(str(frame_path))
-    if img is None:
-        print("❌ Frame image not found")
-        sys.exit(1)
+def lint_rect_bounds(name: str, rect, img_w: int, img_h: int) -> List[LintMessage]:
+    x, y, w, h = rect
+    msgs = []
 
-    h, w = img.shape[:2]
-    regions = regions_from_yaml(regions_path)
+    if x < 0 or y < 0:
+        msgs.append(warn(name, "Rect has negative origin"))
 
-    issues = lint_regions(regions, w, h, run_dir)
+    if x + w > img_w or y + h > img_h:
+        msgs.append(warn(name, "Rect extends outside image bounds"))
 
-    if not issues:
-        print("✓ No region issues found")
+    return msgs
+
+
+# -----------------------------
+# Template linting
+# -----------------------------
+
+def lint_template(name: str, r: Dict, base_dir: Path | None) -> List[LintMessage]:
+    msgs = []
+    tmpl = r.get("template")
+
+    if not tmpl:
+        return [err(name, "Template region missing 'template' block")]
+
+    img = tmpl.get("image")
+    if not img:
+        msgs.append(err(name, "Template missing 'image'"))
+    elif base_dir:
+        p = (base_dir / img).resolve()
+        if not p.exists():
+            msgs.append(err(name, f"Template image not found: {img}"))
+
+    thresh = tmpl.get("threshold", 0.8)
+    if not (0.0 < thresh <= 1.0):
+        msgs.append(warn(name, f"Template threshold out of range: {thresh}"))
+
+    return msgs
+
+
+# -----------------------------
+# OCR linting
+# -----------------------------
+
+def lint_ocr(name: str, r: Dict) -> List[LintMessage]:
+    msgs = []
+    ocr = r.get("ocr")
+
+    if not ocr:
+        return [err(name, "OCR region missing 'ocr' block")]
+
+    text = ocr.get("text")
+    if not text:
+        msgs.append(err(name, "OCR missing 'text'"))
+
+    match = ocr.get("match", "contains")
+    if match not in {"contains", "exact", "regex"}:
+        msgs.append(warn(name, f"Unknown OCR match mode '{match}'"))
+
+    conf = ocr.get("confidence", 0.5)
+    if not (0.0 <= conf <= 1.0):
+        msgs.append(warn(name, f"OCR confidence out of range: {conf}"))
+
+    return msgs
+
+
+# -----------------------------
+# Hybrid linting (⭐ IMPORTANT)
+# -----------------------------
+
+def lint_hybrid(name: str, r: Dict, base_dir: Path | None) -> List[LintMessage]:
+    msgs = []
+
+    has_template = "template" in r
+    has_ocr = "ocr" in r
+
+    if not has_template:
+        msgs.append(err(name, "Hybrid region missing 'template'"))
     else:
-        print("⚠ Region issues:")
-        for name, msgs in issues.items():
-            for msg in msgs:
-                print(f"  {name}: {msg}")
+        msgs.extend(lint_template(name, r, base_dir))
+
+    if not has_ocr:
+        msgs.append(err(name, "Hybrid region missing 'ocr'"))
+    else:
+        msgs.extend(lint_ocr(name, r))
+
+    logic = r.get("logic")
+    if not logic:
+        msgs.append(warn(name, "Hybrid region missing 'logic' block"))
+        return msgs
+
+    require = logic.get("require")
+    if not isinstance(require, list):
+        msgs.append(err(name, "Hybrid logic.require must be a list"))
+        return msgs
+
+    valid_keys = {"template", "ocr"}
+    for k in require:
+        if k not in valid_keys:
+            msgs.append(err(name, f"Invalid hybrid requirement '{k}'"))
+
+    if not require:
+        msgs.append(warn(name, "Hybrid logic.require is empty"))
+
+    if len(require) == 1:
+        msgs.append(warn(
+            name,
+            f"Hybrid requires only '{require[0]}'; consider simplifying type"
+        ))
+
+    agg = logic.get("aggregate", "min")
+    if agg not in {"min", "mean", "product"}:
+        msgs.append(warn(name, f"Unknown hybrid aggregate '{agg}'"))
+
+    return msgs
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def err(region: str, msg: str) -> LintMessage:
+    return LintMessage("error", region, msg)
+
+
+def warn(region: str, msg: str) -> LintMessage:
+    return LintMessage("warning", region, msg)

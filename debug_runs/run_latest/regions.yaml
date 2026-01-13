@@ -1,8 +1,22 @@
-- annotation: undock button
-  name: button_undock
-  template_image: templates\button-undock.png
+- name: button_undock
   type: hybrid
-  h: 400
-  w: 400
-  x: 3300
-  y: 100
+  annotation: "Undock button"
+
+  rect: [3300, 100, 400, 400]
+
+  template:
+    image: templates/button-undock.png
+    threshold: 0.85
+
+  ocr:
+    text: "Undock"
+    match: contains
+    confidence: 0.6
+
+  logic:
+    require: [template, ocr]
+    aggregate: min        # min | mean | product
+
+  click:
+     mode: random_inset
+     inset: [10, 6]

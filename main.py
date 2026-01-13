@@ -1,186 +1,249 @@
-"""
-main.py
-
-Offline runner for UI Vision Bot.
-Processes frames from a run_dir using regions.yaml,
-runs OCR and template matching, and prints results.
-
-Safe to import from live_runner.py (no side effects).
-"""
-
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Dict
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
-import yaml
 import easyocr
 
-from utils.region_linter import lint_regions, Region
+from utils.region_linter import lint_regions
+from utils.hybrid_eval import aggregate_confidence
 
 
-# =========================
-# Regions loader
-# =========================
-def load_regions_yaml(path: Path) -> List[Region]:
+# -----------------------------
+# OCR Reader (lazy init)
+# -----------------------------
+
+_OCR_READER = None
+
+
+def get_ocr_reader(gpu=True):
+    global _OCR_READER
+    if _OCR_READER is None:
+        _OCR_READER = easyocr.Reader(["en"], gpu=gpu)
+    return _OCR_READER
+
+
+# -----------------------------
+# Region loading
+# -----------------------------
+
+def load_regions_yaml(path: Path) -> List[dict]:
+    import yaml
+
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    with open(path, "r", encoding="utf-8") as f:
+        regions = yaml.safe_load(f)
+
+    if not isinstance(regions, list):
+        raise ValueError("regions.yaml must contain a list")
+
+    return regions
+
+# -----------------------------
+# Policy loading
+# -----------------------------
+def load_policy_yaml(path: Path) -> list[dict]:
+    import yaml
+
     if not path.exists():
         return []
 
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or []
+        data = yaml.safe_load(f)
 
-    regions: List[Region] = []
-    for d in data:
-        regions.append(Region(
-            name=d.get("name", ""),
-            type=d.get("type", "button"),
-            x=int(d.get("x", 0)),
-            y=int(d.get("y", 0)),
-            w=int(d.get("w", 0)),
-            h=int(d.get("h", 0)),
-            annotation=d.get("annotation", ""),
-            template_image=d.get("template_image", "")
-        ))
-    return regions
+    return data.get("policies", [])
 
 
-# =========================
-# OCR
-# =========================
-def run_ocr(frame: np.ndarray, regions: List[Region], reader) -> Dict[str, str]:
+# -----------------------------
+# Template matching
+# -----------------------------
+
+def match_templates(
+    frame: np.ndarray,
+    regions: List[dict],
+) -> Dict[str, Tuple[bool, float]]:
+    """
+    Returns:
+        { region_name: (matched, confidence) }
+    """
     results = {}
 
     for r in regions:
-        if r.type not in ("ocr", "hybrid"):
+        name = r["name"]
+        if r["type"] not in {"template", "hybrid"}:
             continue
 
-        roi = frame[r.y:r.y + r.h, r.x:r.x + r.w]
-        if roi.size == 0:
-            results[r.name] = ""
+        tmpl_cfg = r.get("template")
+        if not tmpl_cfg:
+            results[name] = (False, 0.0)
             continue
 
-        try:
-            text = reader.readtext(roi, detail=0)
-            results[r.name] = " ".join(text)
-        except Exception:
-            results[r.name] = ""
+        rect = r["rect"]
+        x, y, w, h = rect
+        roi = frame[y : y + h, x : x + w]
+
+        tmpl_path = Path(tmpl_cfg["image"])
+        if not tmpl_path.exists():
+            results[name] = (False, 0.0)
+            continue
+
+        tmpl = cv2.imread(str(tmpl_path))
+        if tmpl is None:
+            results[name] = (False, 0.0)
+            continue
+
+        method = tmpl_cfg.get("method", cv2.TM_CCOEFF_NORMED)
+        res = cv2.matchTemplate(roi, tmpl, method)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
+
+        threshold = tmpl_cfg.get("threshold", 0.8)
+        results[name] = (max_val >= threshold, float(max_val))
 
     return results
 
 
-# =========================
-# Template matching
-# =========================
-def match_templates(
+# -----------------------------
+# OCR
+# -----------------------------
+
+def run_ocr(
     frame: np.ndarray,
-    regions: List[Region],
-    run_dir: Path
-) -> Dict[str, tuple]:
-    matches = {}
+    regions: List[dict],
+    gpu=True,
+) -> Dict[str, Tuple[bool, float]]:
+    """
+    Returns:
+        { region_name: (matched, confidence) }
+    """
+    reader = get_ocr_reader(gpu=gpu)
+    results = {}
 
     for r in regions:
-        if r.type not in ("template", "hybrid"):
-            continue
-        if not r.template_image:
-            continue
-
-        template_path = run_dir / r.template_image
-        if not template_path.exists():
+        name = r["name"]
+        if r["type"] not in {"ocr", "hybrid"}:
             continue
 
-        template = cv2.imread(str(template_path), cv2.IMREAD_COLOR)
-        if template is None:
+        ocr_cfg = r.get("ocr")
+        if not ocr_cfg:
+            results[name] = (False, 0.0)
             continue
 
-        res = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        matches[r.name] = (max_val, max_loc)
+        rect = r["rect"]
+        x, y, w, h = rect
+        roi = frame[y : y + h, x : x + w]
 
-    return matches
+        detections = reader.readtext(roi)
 
+        target = ocr_cfg.get("text", "")
+        match_mode = ocr_cfg.get("match", "contains")
+        min_conf = ocr_cfg.get("confidence", 0.5)
 
-# =========================
-# Frame loader
-# =========================
-def load_frames(run_dir: Path) -> List[Path]:
-    frame_dir = run_dir / "frames"
-    if not frame_dir.exists():
-        return []
-    return sorted(frame_dir.glob("*.png"))
+        best_conf = 0.0
+        matched = False
 
+        for _, text, conf in detections:
+            norm_text = text.strip()
+            if not norm_text:
+                continue
 
-# =========================
-# Main execution
-# =========================
-def main(run_dir_path: str):
-    run_dir = Path(run_dir_path)
-    if not run_dir.exists():
-        print(f"❌ Run directory not found: {run_dir}")
-        return
+            text_match = False
+            if match_mode == "exact":
+                text_match = norm_text == target
+            elif match_mode == "contains":
+                text_match = target.lower() in norm_text.lower()
+            elif match_mode == "regex":
+                import re
+                text_match = bool(re.search(target, norm_text))
 
-    frames = load_frames(run_dir)
-    if not frames:
-        print("❌ No frames found")
-        return
+            if text_match:
+                best_conf = max(best_conf, conf)
+                matched = conf >= min_conf
 
-    regions = load_regions_yaml(run_dir / "regions.yaml")
-    if not regions:
-        print("⚠ No regions defined")
+        results[name] = (matched, float(best_conf))
 
-    # Load first frame to get dimensions
-    first_frame = cv2.imread(str(frames[0]))
-    if first_frame is None:
-        print("❌ Failed to load first frame")
-        return
-
-    h, w = first_frame.shape[:2]
-
-    # Lint regions (SAFE HERE)
-    issues = lint_regions(regions, w, h, run_dir)
-    if issues:
-        print("⚠ Region lint issues:")
-        for name, msgs in issues.items():
-            for msg in msgs:
-                print(f"  {name}: {msg}")
-
-    # OCR reader (CPU-safe for AMD GPU systems)
-    reader = easyocr.Reader(["en"], gpu=False)
-
-    # Process frames
-    for idx, frame_path in enumerate(frames):
-        frame = cv2.imread(str(frame_path))
-        if frame is None:
-            continue
-
-        ocr_results = run_ocr(frame, regions, reader)
-        template_results = match_templates(frame, regions, run_dir)
-
-        print(f"\nFrame {idx + 1}/{len(frames)}: {frame_path.name}")
-
-        for r in regions:
-            outputs = []
-
-            if r.type in ("ocr", "hybrid"):
-                outputs.append(f"OCR='{ocr_results.get(r.name, '')}'")
-
-            if r.type in ("template", "hybrid"):
-                match = template_results.get(r.name)
-                if match:
-                    outputs.append(f"match={match[0]:.2f}")
-
-            if outputs:
-                print(f"  - {r.name} [{r.type}] ({r.annotation}): " + " | ".join(outputs))
+    return results
 
 
-# =========================
-# CLI entry point
-# =========================
-if __name__ == "__main__":
-    import sys
+# -----------------------------
+# Hybrid evaluation (shared)
+# -----------------------------
 
-    if len(sys.argv) < 2:
-        print("Usage: python main.py <run_dir>")
-        sys.exit(1)
+def evaluate_hybrid_region(region, template_result, ocr_result):
+    logic = region.get("logic", {})
+    require = logic.get("require", ["template", "ocr"])
+    aggregate = logic.get("aggregate", "min")
 
-    main(sys.argv[1])
+    checks = {
+        "template": template_result,
+        "ocr": ocr_result,
+    }
+
+    for key in require:
+        matched, _ = checks[key]
+        if not matched:
+            return False, 0.0, key
+
+    confidences = [checks[k][1] for k in require]
+    return True, aggregate_confidence(confidences, aggregate), None
+
+
+# -----------------------------
+# Frame analysis entry point
+# -----------------------------
+
+def analyze_frame(
+    frame: np.ndarray,
+    regions: List[dict],
+    gpu=True,
+):
+    """
+    Unified analysis used by UI Lab, replay viewer, or live runner.
+
+    Returns:
+        {
+          region_name: {
+            matched: bool,
+            confidence: float,
+            type: str
+          }
+        }
+    """
+    template_results = match_templates(frame, regions)
+    ocr_results = run_ocr(frame, regions, gpu=gpu)
+
+    results = {}
+
+    for r in regions:
+        name = r["name"]
+        rtype = r["type"]
+
+        if rtype == "template":
+            m, c = template_results.get(name, (False, 0.0))
+            results[name] = {
+                "matched": m,
+                "confidence": c,
+                "type": rtype,
+            }
+
+        elif rtype == "ocr":
+            m, c = ocr_results.get(name, (False, 0.0))
+            results[name] = {
+                "matched": m,
+                "confidence": c,
+                "type": rtype,
+            }
+
+        elif rtype == "hybrid":
+            tmpl = template_results.get(name, (False, 0.0))
+            ocr = ocr_results.get(name, (False, 0.0))
+            ok, conf, failed = evaluate_hybrid_region(r, tmpl, ocr)
+            results[name] = {
+                "matched": ok,
+                "confidence": conf,
+                "type": rtype,
+                "failed": failed,
+            }
+
+    return results
