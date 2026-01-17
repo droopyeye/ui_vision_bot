@@ -124,7 +124,26 @@ class UILabMainWindow(QMainWindow):
         layout = QHBoxLayout(central)
         self.setCentralWidget(central)
 
-        # Left: image
+        # Left: frame list browser
+        left = QVBoxLayout()
+        layout.addLayout(left, 1)
+
+        left.addWidget(QLabel("Frames"))
+        self.frame_list = QListWidget()
+        self.frame_list.currentItemChanged.connect(self._select_frame)
+        left.addWidget(self.frame_list)
+
+        # Populate frame list
+        for i, frame_path in enumerate(self.frames):
+            item = QListWidgetItem(frame_path.name)
+            item.setData(Qt.ItemDataRole.UserRole, i)
+            self.frame_list.addItem(item)
+
+        # Set first frame as selected
+        if self.frames:
+            self.frame_list.setCurrentRow(0)
+
+        # Center: image
         self.view = ImageView(self)
         layout.addWidget(self.view, 3)
 
@@ -197,6 +216,13 @@ class UILabMainWindow(QMainWindow):
         right.addWidget(self.preview_checkbox)
 
     # ---------------- Frame ----------------
+
+    def _select_frame(self, item):
+        """Handle frame selection from the list"""
+        if not item:
+            return
+        self.idx = item.data(Qt.ItemDataRole.UserRole)
+        self._load_frame()
 
     def _load_frame(self):
         img = cv2.imread(str(self.frames[self.idx]))
@@ -451,12 +477,19 @@ class UILabMainWindow(QMainWindow):
     # ---------------- Entry ----------------
 
 def main():
+    # Default to debug_runs/run_latest if no run_dir specified
     if len(sys.argv) < 2:
-        print("Usage: ui_lab.py <run_dir>")
-        sys.exit(1)
+        run_dir = Path(__file__).parent.parent / "debug_runs" / "run_latest"
+        if not run_dir.exists():
+            print("Usage: ui_lab.py <run_dir>")
+            print(f"Default run_dir not found: {run_dir}")
+            sys.exit(1)
+        print(f"Using default run_dir: {run_dir}")
+    else:
+        run_dir = sys.argv[1]
 
     app = QApplication(sys.argv)
-    win = UILabMainWindow(sys.argv[1])
+    win = UILabMainWindow(run_dir)
     win.resize(1600, 900)
     win.show()
     sys.exit(app.exec())
