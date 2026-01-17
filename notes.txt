@@ -25,3 +25,13 @@ python tools/ui_lab.py
 (ui_vision_lab) C:\...\ui_vision_bot> python -m tools.live_runner debug_runs/run_latest
 
 (ui_vision_lab) C:\...\ui_vision_bot> python -m tools.ui_lab debug_runs/run_latest
+
+
+# See what changed
+git diff 291197a -- tools/ui_lab.py
+
+# Restore the file
+git checkout 291197a -- tools/ui_lab.py
+
+# Commit the revert
+git commit -m "Revert ui_lab.py to revision 291197a"
