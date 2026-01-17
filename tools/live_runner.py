@@ -74,9 +74,20 @@ try:
             # Optional click execution
             if CLICK_ENABLED and r.matched and r.click:
                 x, y, w, h = r.rect
-                mode = r.click.get("mode", "center")
                 offset = r.click.get("offset", [0,0])
-                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+
+                # Use template match location for template/hybrid types
+                if r.type in ["template", "hybrid"] and r.template_match_loc and r.template_size:
+                    match_x, match_y = r.template_match_loc
+                    tmpl_w, tmpl_h = r.template_size
+                    # Calculate center of matched template
+                    cx = x + match_x + tmpl_w // 2
+                    cy = y + match_y + tmpl_h // 2
+                else:
+                    # Fallback to region center for OCR-only or when no match
+                    mode = r.click.get("mode", "center")
+                    cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+
                 cx += offset[0]; cy += offset[1]
                 pyautogui.click(cx, cy)
                 print(f"Clicked {r.name} at {cx},{cy}")

@@ -45,6 +45,10 @@ class Region:
         self.hybrid_confidence = 0.0
         self.matched = False  # True if template/OCR passes threshold
 
+        # template match location (offset within ROI)
+        self.template_match_loc = None  # (x_offset, y_offset) within the region rect
+        self.template_size = None  # (width, height) of matched template
+
     def to_dict(self):
         return {
             "name": self.name,
@@ -357,6 +361,10 @@ class UILabMainWindow(QMainWindow):
             _, max_val, _, max_loc = cv2.minMaxLoc(res)
             r.template_confidence = float(max_val)
 
+            # Store match location and template size
+            r.template_match_loc = max_loc
+            r.template_size = (tmpl.shape[1], tmpl.shape[0])
+
             # Draw template match rectangle
             top_left = (x + max_loc[0], y + max_loc[1])
             bottom_right = (top_left[0] + tmpl.shape[1], top_left[1] + tmpl.shape[0])
@@ -368,9 +376,13 @@ class UILabMainWindow(QMainWindow):
 
             # Draw click point if enabled
             if self.preview_clicks and r.click:
-                mode = r.click.get("mode", "center")
                 offset = r.click.get("offset", [0, 0])
-                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+                # Use template match location
+                match_x, match_y = r.template_match_loc
+                tmpl_w, tmpl_h = r.template_size
+                # Calculate center of matched template
+                cx = x + match_x + tmpl_w // 2
+                cy = y + match_y + tmpl_h // 2
                 cx += offset[0]
                 cy += offset[1]
                 self.view.scene().addEllipse(cx-3, cy-3, 6, 6,
@@ -411,9 +423,20 @@ class UILabMainWindow(QMainWindow):
 
             # Click point
             if self.preview_clicks and r.click:
-                mode = r.click.get("mode", "center")
                 offset = r.click.get("offset", [0,0])
-                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+
+                # Use template match location for template/hybrid types
+                if r.type in ["template", "hybrid"] and r.template_match_loc and r.template_size:
+                    match_x, match_y = r.template_match_loc
+                    tmpl_w, tmpl_h = r.template_size
+                    # Calculate center of matched template
+                    cx = x + match_x + tmpl_w // 2
+                    cy = y + match_y + tmpl_h // 2
+                else:
+                    # Fallback to region center for OCR-only or when no match
+                    mode = r.click.get("mode", "center")
+                    cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+
                 cx += offset[0]; cy += offset[1]
                 self.view.scene().addEllipse(cx-3, cy-3, 6, 6,
                                             QPen(QColor("red")),
@@ -455,8 +478,11 @@ class UILabMainWindow(QMainWindow):
                         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                         tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
                         res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-                        _, max_val, _, _ = cv2.minMaxLoc(res)
+                        _, max_val, _, max_loc = cv2.minMaxLoc(res)
                         r.template_confidence = float(max_val)
+                        # Store match location and template size
+                        r.template_match_loc = max_loc
+                        r.template_size = (tmpl.shape[1], tmpl.shape[0])
                         print(f"{r.name} ROI size: {roi.shape}, Template size: {tmpl.shape}, Confidence: {r.template_confidence}")
 
             # ---- Hybrid aggregation ----

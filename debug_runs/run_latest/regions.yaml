@@ -13,18 +13,18 @@
   - 80
   template_image: templates/button-undock.png
   type: hybrid
-- annotation: ''
+- annotation: docking button
   click:
     mode: center
     offset:
     - 0
     - 0
-  name: region_1
+  name: button_dock
   ocr_text: ''
   rect:
   - 3400
   - 180
   - 400
   - 100
-  template_image: null
-  type: ocr
+  template_image: templates/button-dock.png
+  type: template

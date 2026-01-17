@@ -23,6 +23,10 @@ class Region:
         self.hybrid_confidence = 0.0
         self.matched = False
 
+        # template match location (offset within ROI)
+        self.template_match_loc = None  # (x_offset, y_offset) within the region rect
+        self.template_size = None  # (width, height) of matched template
+
 # -------------------------------
 # OCR Reader
 # -------------------------------
@@ -32,7 +36,10 @@ reader = easyocr.Reader(["en"], gpu=True)
 # Template matching helper
 # -------------------------------
 def match_template_region(frame, region, run_dir):
-    """Return template confidence for a single region."""
+    """
+    Return template confidence for a single region.
+    Also updates region.template_match_loc and region.template_size.
+    """
     if not region.template_image:
         return 0.0
 
@@ -55,7 +62,11 @@ def match_template_region(frame, region, run_dir):
     tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
 
     res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, _ = cv2.minMaxLoc(res)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+
+    # Store match location and template size
+    region.template_match_loc = max_loc  # (x_offset, y_offset) within ROI
+    region.template_size = (tmpl.shape[1], tmpl.shape[0])  # (width, height)
 
     return float(max_val)
 
@@ -121,11 +132,22 @@ def draw_debug_overlay(frame, regions):
         color = (0,255,0) if r.matched else (0,0,255)
         cv2.rectangle(frame_overlay, (x,y), (x+w, y+h), color, 2)
 
-        # Click point
+        # Click point - use template match location if available
         if r.click:
             mode = r.click.get("mode", "center")
             offset = r.click.get("offset", [0,0])
-            cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+
+            # Use template match location for template/hybrid types
+            if r.type in ["template", "hybrid"] and r.template_match_loc and r.template_size:
+                match_x, match_y = r.template_match_loc
+                tmpl_w, tmpl_h = r.template_size
+                # Calculate center of matched template in absolute coordinates
+                cx = x + match_x + tmpl_w // 2
+                cy = y + match_y + tmpl_h // 2
+            else:
+                # Fallback to region center for OCR-only or when no match
+                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
+
             cx += offset[0]; cy += offset[1]
             cv2.circle(frame_overlay, (cx, cy), 5, (255,0,0), -1)
 
