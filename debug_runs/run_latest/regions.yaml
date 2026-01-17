@@ -13,3 +13,18 @@
   - 80
   template_image: templates/button-undock.png
   type: hybrid
+- annotation: ''
+  click:
+    mode: center
+    offset:
+    - 0
+    - 0
+  name: region_1
+  ocr_text: ''
+  rect:
+  - 3400
+  - 180
+  - 400
+  - 100
+  template_image: null
+  type: ocr
