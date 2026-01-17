@@ -1,466 +1,328 @@
 import sys
-import yaml
 import cv2
+import yaml
 import numpy as np
 from pathlib import Path
+from dataclasses import dataclass, field
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, QTimer
-from PyQt6.QtGui import QPixmap, QImage, QPen, QColor, QAction
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QFileDialog,
-    QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QListWidget, QListWidgetItem, QLineEdit, QTextEdit,
-    QComboBox, QSpinBox, QGraphicsView, QGraphicsScene,
-    QGraphicsRectItem, QCheckBox, QMessageBox
+    QApplication, QMainWindow, QWidget, QLabel, QListWidget,
+    QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
+    QDockWidget, QMessageBox
 )
+from PyQt6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
+from PyQt6.QtCore import Qt
 
 import easyocr
 
 
-# ----------------------------
-# Utilities
-# ----------------------------
+# =========================
+# Data model
+# =========================
 
-def cv_to_qimage(img):
-    h, w, ch = img.shape
-    bytes_per_line = ch * w
-    return QImage(img.data, w, h, bytes_per_line, QImage.Format.Format_BGR888)
-
-
-# ----------------------------
-# Region Model
-# ----------------------------
-
+@dataclass
 class Region:
-    def __init__(self, data):
-        self.name = data.get("name", "")
-        self.annotation = data.get("annotation", "")
-        self.type = data.get("type", "ocr")
-        self.rect = data.get("rect", [0, 0, 100, 100])
-        self.template_image = data.get("template_image")
-        self.ocr_text = data.get("ocr_text", "")
-        self.click = data.get("click", {"mode": "center", "offset": [0, 0]})
-        self.template_confidence = 0.0
-        self.ocr_confidence = 0.0
-        self.hybrid_confidence = 0.0
-        self.matched = False  # True if template/OCR passes threshold
+    name: str
+    rect: list  # [x,y,w,h]
+    type: str = "template"  # template | ocr | hybrid
+    template_image: str | None = None
+    annotation: str = ""
+    click: dict | None = None
 
-    def to_dict(self):
-        return {
-            "name": self.name,
-            "annotation": self.annotation,
-            "type": self.type,
-            "rect": self.rect,
-            "template_image": self.template_image,
-            "ocr_text": self.ocr_text,
-            "click": self.click,
+    # runtime
+    template_conf: float = 0.0
+    ocr_text: str = ""
+    matched: bool = False
+    template_heatmap: np.ndarray | None = None
+
+
+# =========================
+# Utility functions
+# =========================
+
+def load_regions_yaml(path: Path):
+    if not path.exists():
+        return []
+    with open(path, "r") as f:
+        data = yaml.safe_load(f) or []
+    regions = []
+    for r in data:
+        regions.append(Region(**r))
+    return regions
+
+
+def save_regions_yaml(path: Path, regions):
+    out = []
+    for r in regions:
+        d = {
+            "name": r.name,
+            "rect": r.rect,
+            "type": r.type,
+            "annotation": r.annotation
         }
+        if r.template_image:
+            d["template_image"] = r.template_image
+        if r.click:
+            d["click"] = r.click
+        out.append(d)
+    with open(path, "w") as f:
+        yaml.safe_dump(out, f)
 
 
-# ----------------------------
-# Graphics View (Zoom + Draw)
-# ----------------------------
+def match_template_gray(frame, region: Region):
+    region.template_conf = 0.0
+    region.template_heatmap = None
 
-class ImageView(QGraphicsView):
+    if not region.template_image:
+        return
+
+    tpl = cv2.imread(region.template_image, cv2.IMREAD_GRAYSCALE)
+    if tpl is None:
+        return
+
+    x, y, w, h = region.rect
+    roi = frame[y:y+h, x:x+w]
+    if roi.size == 0:
+        return
+
+    roi_g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # ROI must be >= template
+    if roi_g.shape[0] < tpl.shape[0] or roi_g.shape[1] < tpl.shape[1]:
+        return
+
+    res = cv2.matchTemplate(roi_g, tpl, cv2.TM_CCOEFF_NORMED)
+    region.template_conf = float(res.max())
+    region.template_heatmap = res
+
+
+def run_ocr(frame, region: Region, reader):
+    x, y, w, h = region.rect
+    roi = frame[y:y+h, x:x+w]
+    if roi.size == 0:
+        region.ocr_text = ""
+        return
+
+    results = reader.readtext(roi, detail=0)
+    region.ocr_text = " ".join(results)
+
+
+def analyze_region(frame, region: Region, reader):
+    region.matched = False
+
+    if region.type in ("template", "hybrid"):
+        match_template_gray(frame, region)
+
+    if region.type in ("ocr", "hybrid"):
+        run_ocr(frame, region, reader)
+
+    if region.type == "template":
+        region.matched = region.template_conf >= 0.8
+    elif region.type == "ocr":
+        region.matched = len(region.ocr_text) > 0
+    elif region.type == "hybrid":
+        region.matched = (
+            region.template_conf >= 0.8 and len(region.ocr_text) > 0
+        )
+
+
+# =========================
+# Canvas widget
+# =========================
+
+class ImageCanvas(QLabel):
     def __init__(self, parent):
-        super().__init__()
-        self.parent = parent
-        self.setScene(QGraphicsScene())
-        self._zoom = 0
-        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        super().__init__(parent)
+        self.main = parent
+        self.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
-    def wheelEvent(self, event):
-        factor = 1.25 if event.angleDelta().y() > 0 else 0.8
-        self.scale(factor, factor)
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.main.current_img is None:
+            return
 
-    def mousePressEvent(self, event):
-        if self.parent.draw_mode:
-            self.parent.start_rect(self.mapToScene(event.position().toPoint()))
-        super().mousePressEvent(event)
+        painter = QPainter(self)
 
-    def mouseMoveEvent(self, event):
-        if self.parent.draw_mode:
-            self.parent.update_rect(self.mapToScene(event.position().toPoint()))
-        super().mouseMoveEvent(event)
+        # ---- HEATMAP ----
+        if (
+            self.main.show_heatmap
+            and self.main.selected_region
+            and self.main.selected_region.template_heatmap is not None
+        ):
+            r = self.main.selected_region
+            heat = r.template_heatmap
 
-    def mouseReleaseEvent(self, event):
-        if self.parent.draw_mode:
-            self.parent.finish_rect()
-        super().mouseReleaseEvent(event)
+            # Normalize to 0–255
+            heat_norm = cv2.normalize(heat, None, 0, 255, cv2.NORM_MINMAX)
+            heat_norm = heat_norm.astype(np.uint8)
+
+            # Apply colormap
+            heat_color = cv2.applyColorMap(heat_norm, cv2.COLORMAP_JET)
+
+            # Resize to ROI size
+            x, y, w, h = r.rect
+            heat_color = cv2.resize(heat_color, (w, h))
+
+            # Convert to QImage
+            qimg = QImage(
+                heat_color.data,
+                w, h,
+                3 * w,
+                QImage.Format.Format_BGR888
+            )
+
+            painter.setOpacity(0.6)
+            painter.drawImage(x, y, qimg)
+            painter.setOpacity(1.0)
+
+    # ---- REGIONS ----
+    for r in self.main.regions:
+        x, y, w, h = r.rect
+        color = QColor(0, 255, 0) if r.matched else QColor(255, 0, 0)
+        painter.setPen(QPen(color, 2))
+        painter.drawRect(x, y, w, h)
+
+        label = f"{r.name} T:{r.template_conf:.2f}"
+        if r.ocr_text:
+            label += f' OCR:"{r.ocr_text}"'
+        painter.drawText(x + 4, y + 14, label)
 
 
-# ----------------------------
-# Main UI Lab Window
-# ----------------------------
+
+# =========================
+# Main window
+# =========================
 
 class UILabMainWindow(QMainWindow):
-    def __init__(self, run_dir):
+    def __init__(self, run_dir: Path):
         super().__init__()
         self.setWindowTitle("UI Vision Lab")
 
-        self.run_dir = Path(run_dir)
-        self.frames = sorted(self.run_dir.glob("frames/*.png"))
-        if not self.frames:
-            QMessageBox.critical(self, "Error", "No frames found")
-            sys.exit(1)
+        self.run_dir = run_dir
+        self.frames_dir = run_dir / "frames"
+        self.regions_path = run_dir / "regions.yaml"
 
-        self.idx = 0
-        self.regions = []
-        self.draw_mode = False
-        self.temp_rect_item = None
-        self.preview_clicks = True
+        self.reader = easyocr.Reader(["en"], gpu=False)
 
-        # OCR reader (GPU auto-detect)
-        self.reader = easyocr.Reader(["en"], gpu=True)
+        self.frames = sorted(self.frames_dir.glob("*.png"))
+        self.frame_idx = 0
+        self.current_img = None
+
+        self.regions = load_regions_yaml(self.regions_path)
+
+        self.canvas = ImageCanvas(self)
+        self.setCentralWidget(self.canvas)
+        self.show_heatmap = False
+        self.selected_region = None
 
         self._build_ui()
-        self._load_regions()
-        self._load_frame()
+        self._load_frame(0)
 
-    # ---------------- UI ----------------
+    # ---------- UI ----------
 
     def _build_ui(self):
-        central = QWidget()
-        layout = QHBoxLayout(central)
-        self.setCentralWidget(central)
+        # toolbar
+        bar = QWidget()
+        layout = QHBoxLayout(bar)
 
-        # Left: image
-        self.view = ImageView(self)
-        layout.addWidget(self.view, 3)
+        btn_prev = QPushButton("◀ Prev")
+        btn_next = QPushButton("Next ▶")
+        btn_save = QPushButton("Save Regions")
 
-        # Right: controls
-        right = QVBoxLayout()
-        layout.addLayout(right, 1)
+        btn_prev.clicked.connect(self.prev_frame)
+        btn_next.clicked.connect(self.next_frame)
+        btn_save.clicked.connect(self.save_regions)
 
-        self.region_list = QListWidget()
-        self.region_list.currentItemChanged.connect(self._select_region)
-        right.addWidget(self.region_list)
+        btn_heatmap = QPushButton("Heatmap")
+        btn_heatmap.setCheckable(True)
+        btn_heatmap.toggled.connect(self.toggle_heatmap)
+        
+        layout.addWidget(btn_heatmap)
+        layout.addWidget(btn_prev)
+        layout.addWidget(btn_next)
+        layout.addWidget(btn_save)        
 
-        self.name_edit = QLineEdit()
-        self.annotation_edit = QTextEdit()
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["ocr", "template", "hybrid"])
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self._wrap(bar))
 
-        self.ocr_text_edit = QLineEdit()
-        self.template_path_edit = QLineEdit()
+        # frame list
+        dock = QDockWidget("Frames", self)
+        self.frame_list = QListWidget()
+        for f in self.frames:
+            self.frame_list.addItem(f.name)
+        self.frame_list.currentRowChanged.connect(self._load_frame)
+        dock.setWidget(self.frame_list)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
 
-        right.addWidget(QLabel("Name"))
-        right.addWidget(self.name_edit)
-        right.addWidget(QLabel("Annotation"))
-        right.addWidget(self.annotation_edit)
-        right.addWidget(QLabel("Type"))
-        right.addWidget(self.type_combo)
-        right.addWidget(QLabel("OCR Text"))
-        right.addWidget(self.ocr_text_edit)
-        right.addWidget(QLabel("Template Image"))
-        right.addWidget(self.template_path_edit)
+    def _wrap(self, widget):
+        from PyQt6.QtWidgets import QToolBar
+        tb = QToolBar()
+        tb.addWidget(widget)
+        return tb
 
-        # REGION rect edits
-        right.addWidget(QLabel("Rect (x, y, w, h)"))
-        self.rect_x = QSpinBox(); self.rect_x.setMaximum(10000)
-        self.rect_y = QSpinBox(); self.rect_y.setMaximum(10000)
-        self.rect_w = QSpinBox(); self.rect_w.setMaximum(5000)
-        self.rect_h = QSpinBox(); self.rect_h.setMaximum(5000)
-        self.rect_x.valueChanged.connect(self._update_rect_from_ui)
-        self.rect_y.valueChanged.connect(self._update_rect_from_ui)
-        self.rect_w.valueChanged.connect(self._update_rect_from_ui)
-        self.rect_h.valueChanged.connect(self._update_rect_from_ui)
-        right.addWidget(self.rect_x)
-        right.addWidget(self.rect_y)
-        right.addWidget(self.rect_w)
-        right.addWidget(self.rect_h)
+    # ---------- Frame logic ----------
 
-        btns = QHBoxLayout()
-        add_btn = QPushButton("Add Region")
-        add_btn.clicked.connect(self._add_region)
-        draw_btn = QPushButton("Draw Rect")
-        draw_btn.clicked.connect(self._toggle_draw)
-        save_btn = QPushButton("Save regions.yaml")
-        save_btn.clicked.connect(self._save_regions)
-        btn_ocr = QPushButton("Analyze Frame")
-        btn_ocr.clicked.connect(self.update_region_analysis)
-        right.addWidget(btn_ocr)
-        btn_template_overlay = QPushButton("Run Template Overlay")
-        btn_template_overlay.clicked.connect(self.run_template_overlay)
-        right.addWidget(btn_template_overlay)
+    def _load_frame(self, idx):
+        if not self.frames:
+            return
+        idx = max(0, min(idx, len(self.frames) - 1))
+        self.frame_idx = idx
+        path = self.frames[idx]
 
-        btns.addWidget(add_btn)
-        btns.addWidget(draw_btn)
-        btns.addWidget(save_btn)
-        right.addLayout(btns)
+        self.current_img = cv2.imread(str(path))
+        self._reanalyze()
 
-        self.preview_checkbox = QCheckBox("Preview Clicks")
-        self.preview_checkbox.setChecked(True)
-        self.preview_checkbox.stateChanged.connect(
-            lambda s: setattr(self, "preview_clicks", bool(s))
+        h, w, _ = self.current_img.shape
+        qimg = QImage(
+            self.current_img.data, w, h, 3 * w, QImage.Format.Format_BGR888
         )
-        right.addWidget(self.preview_checkbox)
+        self.canvas.setPixmap(QPixmap.fromImage(qimg))
+        self.canvas.resize(w, h)
 
-    # ---------------- Frame ----------------
+        self.frame_list.blockSignals(True)
+        self.frame_list.setCurrentRow(idx)
+        self.frame_list.blockSignals(False)
 
-    def _load_frame(self):
-        img = cv2.imread(str(self.frames[self.idx]))
-        self.current_img = img
-        self.view.scene().clear()
-        pix = QPixmap.fromImage(cv_to_qimage(img))
-        self.view.scene().addPixmap(pix)
-        self._draw_regions()
-
-    # ---------------- Regions ----------------
-
-    def _load_regions(self):
-        path = self.run_dir / "regions.yaml"
-        if not path.exists():
-            return
-        data = yaml.safe_load(path.read_text()) or []
-        self.regions = [Region(d) for d in data]
-        self._refresh_region_list()
-
-    def _save_regions(self):
-        path = self.run_dir / "regions.yaml"
-        yaml.safe_dump([r.to_dict() for r in self.regions], path.open("w"))
-        QMessageBox.information(self, "Saved", f"Saved {path}")
-
-    def _refresh_region_list(self):
-        self.region_list.clear()
+    def _reanalyze(self):
+        if self.regions:
+            self.selected_region = self.regions[0]
         for r in self.regions:
-            item = QListWidgetItem(r.name)
-            self.region_list.addItem(item)
+            analyze_region(self.current_img, r, self.reader)
+        self.canvas.update()
 
-    def _select_region(self, item):
-        if not item:
-            return
-        r = self.regions[self.region_list.row(item)]
-        self.name_edit.setText(r.name)
-        self.annotation_edit.setText(r.annotation)
-        self.type_combo.setCurrentText(r.type)
-        self.ocr_text_edit.setText(r.ocr_text)
-        self.template_path_edit.setText(str(r.template_image or ""))
+    def prev_frame(self):
+        self._load_frame(self.frame_idx - 1)
 
-        # Set rect spin boxes
-        x, y, w, h = r.rect
-        self.rect_x.setValue(x)
-        self.rect_y.setValue(y)
-        self.rect_w.setValue(w)
-        self.rect_h.setValue(h)
+    def next_frame(self):
+        self._load_frame(self.frame_idx + 1)
 
-    def _add_region(self):
-        r = Region({"name": f"region_{len(self.regions)}"})
-        self.regions.append(r)
-        self._refresh_region_list()
+    def toggle_heatmap(self, checked):
+        self.show_heatmap = checked
+        self.canvas.update()
 
-    # ---------------- Draw ----------------
+    # ---------- Regions ----------
 
-    def _toggle_draw(self):
-        self.draw_mode = not self.draw_mode
+    def save_regions(self):
+        save_regions_yaml(self.regions_path, self.regions)
+        QMessageBox.information(self, "Saved", "regions.yaml updated")
 
-    def start_rect(self, pos):
-        self.start_pos = pos
-        self.temp_rect_item = QGraphicsRectItem()
-        self.temp_rect_item.setPen(QPen(QColor("yellow"), 2))
-        self.view.scene().addItem(self.temp_rect_item)
 
-    def update_rect(self, pos):
-        if not self.temp_rect_item:
-            return
-        rect = QRectF(self.start_pos, pos).normalized()
-        self.temp_rect_item.setRect(rect)
+# =========================
+# Entry point
+# =========================
 
-    def _update_rect_from_ui(self):
-        item = self.region_list.currentItem()
-        if not item:
-            return
-        r = self.regions[self.region_list.row(item)]
-        r.rect = [
-            self.rect_x.value(),
-            self.rect_y.value(),
-            self.rect_w.value(),
-            self.rect_h.value()
-        ]
-        self._draw_regions()
-
-    def _draw_confidence_overlay(self, frame):
-        for r in self.regions:
-            x, y, w, h = r.rect
-            conf_text = ""
-            if r.type in ["ocr", "hybrid"]:
-                conf_text += f"OCR: {r.ocr_confidence:.2f} "
-            if r.type in ["template", "hybrid"]:
-                conf_text += f"Tmpl: {r.template_confidence:.2f} "
-            if r.type=="hybrid":
-                conf_text += f"Final: {r.hybrid_confidence:.2f}"
-
-            label = self.view.scene().addText(conf_text)
-            label.setDefaultTextColor(QColor("yellow"))
-            label.setPos(x, y-20)
-
-    def run_template_overlay(self):
-        """
-        For each region with a template, perform template matching and
-        draw the match result as a rectangle over the frame.
-        """
-        if not hasattr(self, "current_img"):
-            return
-
-        frame = self.current_img.copy()
-        self.view.scene().clear()
-        pix = QPixmap.fromImage(cv_to_qimage(frame))
-        self.view.scene().addPixmap(pix)
-
-        for r in self.regions:
-            if not r.template_image:
-                continue
-
-            # Load template
-            tmpl_path = (self.run_dir / r.template_image).resolve()
-            tmpl = cv2.imread(str(tmpl_path), cv2.IMREAD_UNCHANGED)
-            if tmpl is None:
-                print(f"⚠️ Template not found for region {r.name}")
-                continue
-
-            # ROI from region rect
-            x, y, w, h = r.rect
-            roi = frame[y:y+h, x:x+w]
-
-            # Convert to grayscale for robustness
-            roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-            tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
-
-            # Run template match
-            res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-            r.template_confidence = float(max_val)
-
-            # Draw template match rectangle
-            top_left = (x + max_loc[0], y + max_loc[1])
-            bottom_right = (top_left[0] + tmpl.shape[1], top_left[1] + tmpl.shape[0])
-            rect_item = self.view.scene().addRect(
-                top_left[0], top_left[1],
-                tmpl.shape[1], tmpl.shape[0],
-                QPen(QColor("red"), 2)
-            )
-
-            # Draw click point if enabled
-            if self.preview_clicks and r.click:
-                mode = r.click.get("mode", "center")
-                offset = r.click.get("offset", [0, 0])
-                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
-                cx += offset[0]
-                cy += offset[1]
-                self.view.scene().addEllipse(cx-3, cy-3, 6, 6,
-                                            QPen(QColor("blue")),
-                                            QColor(0,0,255,100))
-
-            # Add confidence label
-            label_text = f"{r.name} conf: {r.template_confidence:.2f}"
-            label_item = self.view.scene().addText(label_text)
-            label_item.setDefaultTextColor(QColor("yellow"))
-            label_item.setPos(x, y-20)
-
-    def finish_rect(self):
-        rect = self.temp_rect_item.rect()
-        self.view.scene().removeItem(self.temp_rect_item)
-        self.temp_rect_item = None
-        self.draw_mode = False
-
-        r = Region({
-            "name": f"region_{len(self.regions)}",
-            "rect": [int(rect.x()), int(rect.y()), int(rect.width()), int(rect.height())]
-        })
-        self.regions.append(r)
-        self._refresh_region_list()
-        self._draw_regions()
-
-    def _draw_regions(self):
-        self.view.scene().clear()
-        pix = QPixmap.fromImage(cv_to_qimage(self.current_img))
-        self.view.scene().addPixmap(pix)
-
-        for r in self.regions:
-            x, y, w, h = r.rect
-            color = QColor("green") if r.matched else QColor("cyan")
-            rect_item = QGraphicsRectItem(x, y, w, h)
-            rect_item.setPen(QPen(color, 2))
-            self.view.scene().addItem(rect_item)
-
-            # Click point
-            if self.preview_clicks and r.click:
-                mode = r.click.get("mode", "center")
-                offset = r.click.get("offset", [0,0])
-                cx, cy = (x + w//2, y + h//2) if mode=="center" else (x, y)
-                cx += offset[0]; cy += offset[1]
-                self.view.scene().addEllipse(cx-3, cy-3, 6, 6,
-                                            QPen(QColor("red")),
-                                            QColor(255,0,0,100))
-
-            # Confidence overlay
-            conf_text = f"OCR: {r.ocr_confidence:.2f} | Tmpl: {r.template_confidence:.2f}"
-            if r.type == "hybrid":
-                conf_text += f" | Final: {r.hybrid_confidence:.2f}"
-            label = self.view.scene().addText(conf_text)
-            label.setDefaultTextColor(QColor("yellow"))
-            label.setPos(x, y-20)
-
-    def update_region_analysis(self):
-        frame = self.current_img.copy()
-
-        for r in self.regions:
-            # ---- OCR confidence ----
-            if r.type in ["ocr", "hybrid"]:
-                result = self.reader.readtext(frame[r.rect[1]:r.rect[1]+r.rect[3],
-                                                r.rect[0]:r.rect[0]+r.rect[2]])
-                r.ocr_confidence = max([conf for _, text, conf in result], default=0.0)
-
-            # ---- Template confidence ----
-            if r.type in ["template", "hybrid"] and r.template_image:
-                tmpl_path = (self.run_dir / r.template_image).resolve()
-                tmpl = cv2.imread(str(tmpl_path), cv2.IMREAD_UNCHANGED)
-                if tmpl is None:
-                    r.template_confidence = 0.0
-                else:
-                    # Make sure ROI is large enough
-                    x, y, w, h = r.rect
-                    roi = self.current_img[y:y+h, x:x+w]
-                    if roi.shape[0] < tmpl.shape[0] or roi.shape[1] < tmpl.shape[1]:
-                        print(f"ROI smaller than template for {r.name}")
-                        r.template_confidence = 0.0
-                    else:
-                        # Convert both to grayscale for consistent matching
-                        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-                        tmpl_gray = cv2.cvtColor(tmpl, cv2.COLOR_BGR2GRAY)
-                        res = cv2.matchTemplate(roi_gray, tmpl_gray, cv2.TM_CCOEFF_NORMED)
-                        _, max_val, _, _ = cv2.minMaxLoc(res)
-                        r.template_confidence = float(max_val)
-                        print(f"{r.name} ROI size: {roi.shape}, Template size: {tmpl.shape}, Confidence: {r.template_confidence}")
-
-            # ---- Hybrid aggregation ----
-            if r.type == "hybrid":
-                r.hybrid_confidence = (r.ocr_confidence + r.template_confidence) / 2.0
-
-            # Matched threshold (example: 0.7)
-            threshold = 0.7
-            if r.type == "hybrid":
-                r.matched = r.hybrid_confidence >= threshold
-            elif r.type == "ocr":
-                r.matched = r.ocr_confidence >= threshold
-            elif r.type == "template":
-                r.matched = r.template_confidence >= threshold
-
-        self._draw_regions()
-
-    # ---------------- Entry ----------------
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: ui_lab.py <run_dir>")
-        sys.exit(1)
-
-    app = QApplication(sys.argv)
-    win = UILabMainWindow(sys.argv[1])
-    win.resize(1600, 900)
-    win.show()
-    sys.exit(app.exec())
+def find_default_run_dir():
+    base = Path("debug_runs/run_latest")
+    return base if base.exists() else None
 
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+
+    run_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else find_default_run_dir()
+    if not run_dir or not run_dir.exists():
+        QMessageBox.critical(None, "Error", "No valid run_dir found")
+        sys.exit(1)
+
+    win = UILabMainWindow(run_dir)
+    win.show()
+    sys.exit(app.exec())
