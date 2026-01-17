@@ -139,10 +139,6 @@ class UILabMainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, i)
             self.frame_list.addItem(item)
 
-        # Set first frame as selected
-        if self.frames:
-            self.frame_list.setCurrentRow(0)
-
         # Center: image
         self.view = ImageView(self)
         layout.addWidget(self.view, 3)
@@ -214,6 +210,10 @@ class UILabMainWindow(QMainWindow):
             lambda s: setattr(self, "preview_clicks", bool(s))
         )
         right.addWidget(self.preview_checkbox)
+
+        # Set first frame as selected (after all UI elements are created)
+        if self.frames:
+            self.frame_list.setCurrentRow(0)
 
     # ---------------- Frame ----------------
 
